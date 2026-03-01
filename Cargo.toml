@@ -5,17 +5,30 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/auria-core/auria-runtime"
 authors = ["AURIA Team <auria@dust.llc>"]
-description = "AURIA Runtime Core - HTTP/gRPC networking"
+description = "AURIA Runtime Core - HTTP/gRPC/P2P networking"
 
 [dependencies]
 auria-core = { path = "../auria-core", version = "0.1.0"}
 auria-execution = { path = "../auria-execution", version = "0.1.0"}
 auria-config = { path = "../auria-config", version = "0.1.0"}
 anyhow = "1.0"
-tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "time", "signal"] }
-hyper = { version = "1.2", features = ["full"] }
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync", "net"] }
+hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 tower = { version = "0.4", features = ["util"] }
 tonic = "0.10"
 prost = "0.12"
+uuid = { version = "1", features = ["v4", "serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+
