@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
 use futures::{SinkExt, StreamExt};
+use futures_util::stream::{SplitSink, SplitStream};
 
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_PEERS: usize = 50;
@@ -98,7 +99,7 @@ pub struct P2PNetwork {
 
 pub struct PeerConnection {
     pub info: PeerInfo,
-    pub sink: Option<futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, tokio_tungstenite::tungstenite::Message>>,
+    pub sink: Option<SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, tokio_tungstenite::tungstenite::Message>>,
     pub connected_at: u64,
 }
 
@@ -232,7 +233,7 @@ impl P2PNetwork {
         Ok(())
     }
 
-    async fn start_reader_for_peer(&self, addr: String, mut read: futures::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>) {
+    async fn start_reader_for_peer(&self, addr: String, mut read: SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>) {
         let stats = self.stats.clone();
         
         tokio::spawn(async move {
@@ -283,7 +284,7 @@ impl P2PNetwork {
         
         for (_, conn) in peers.iter_mut() {
             if let Some(ref mut sink) = conn.sink {
-                let msg = tokio_tungstenite::tungstenite::Message::Text(
+                let msg: tokio_tungstenite::tungstenite::Message = tokio_tungstenite::tungstenite::Message::Text(
                     String::from_utf8_lossy(&data).to_string()
                 );
                 if sink.send(msg).await.is_ok() {
@@ -309,10 +310,11 @@ impl P2PNetwork {
         
         if let Some(conn) = peers.get_mut(address) {
             if let Some(ref mut sink) = conn.sink {
-                sink.send(tokio_tungstenite::tungstenite::Message::Text(
+                let msg: tokio_tungstenite::tungstenite::Message = tokio_tungstenite::tungstenite::Message::Text(
                     String::from_utf8_lossy(&data).to_string()
-                )).await
-                .map_err(|e| AuriaError::NetworkError(format!("Send failed: {}", e)))?;
+                );
+                sink.send(msg).await
+                    .map_err(|e| AuriaError::NetworkError(format!("Send failed: {}", e)))?;
                 
                 let mut stats = self.stats.write().await;
                 stats.messages_sent += 1;
