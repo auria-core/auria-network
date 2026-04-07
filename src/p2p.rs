@@ -356,7 +356,7 @@ impl P2PNetwork {
         
         tokio::time::sleep(Duration::from_secs(2)).await;
         
-        Err(AuriaError::ShardNotFound(ShardId(shard_id)))
+        Err(AuriaError::ShardNotFound(shard_id))
     }
 
     pub async fn get_peer_count(&self) -> usize {

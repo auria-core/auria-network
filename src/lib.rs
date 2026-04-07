@@ -6,17 +6,21 @@
 //     via HTTP (OpenAI-compatible API), gRPC protocols, and P2P communication.
 //
 pub mod p2p;
+pub mod http;
+pub mod inference;
 
-use auria_core::{AuriaResult, ExecutionOutput, ExecutionState, RequestId, RoutingDecision, ShardId, Tensor, Tier};
+use auria_core::{AuriaResult, RequestId, Tier};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use std::collections::HashMap;
 
+pub use crate::inference::InferenceService;
+
 pub struct NetworkServer {
-    http_port: u16,
-    grpc_port: u16,
+    pub http_port: u16,
+    pub grpc_port: u16,
     handlers: Arc<RwLock<Vec<Box<dyn RequestHandler>>>>,
-    active_requests: Arc<RwLock<HashMap<RequestId, RequestState>>>,
+    pub active_requests: Arc<RwLock<HashMap<RequestId, RequestState>>>,
 }
 
 #[derive(Clone)]
@@ -42,22 +46,35 @@ pub trait RequestHandler: Send + Sync {
     fn supported_tiers(&self) -> &[Tier];
 }
 
+#[derive(Clone)]
 pub struct InferenceRequest {
     pub tier: Tier,
     pub prompt: String,
     pub max_tokens: u32,
 }
 
+#[derive(Clone, Debug)]
 pub struct InferenceResponse {
     pub request_id: RequestId,
     pub tokens: Vec<String>,
     pub usage: UsageInfo,
 }
 
+#[derive(Clone, Debug, Default)]
 pub struct UsageInfo {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+}
+
+impl Default for InferenceResponse {
+    fn default() -> Self {
+        Self {
+            request_id: RequestId([0u8; 16]),
+            tokens: Vec::new(),
+            usage: UsageInfo::default(),
+        }
+    }
 }
 
 impl NetworkServer {

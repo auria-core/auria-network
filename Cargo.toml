@@ -11,6 +11,8 @@ description = "AURIA Runtime Core - P2P networking"
 auria-core = { path = "../auria-core", version = "0.1.0"}
 auria-execution = { path = "../auria-execution", version = "0.1.0"}
 auria-config = { path = "../auria-config", version = "0.1.0"}
+auria-router = { path = "../auria-router", version = "0.1.0"}
+auria-backend-cpu = { path = "../auria-backend-cpu", version = "0.1.0"}
 anyhow = "1.0"
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync", "net"] }
@@ -25,4 +27,9 @@ hex = "0.4"
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
 futures = "0.3"
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+hyper = "1"
+http-body-util = "0.1"
 
