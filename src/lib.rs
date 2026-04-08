@@ -180,7 +180,7 @@ impl GrpcServer {
 
 pub struct P2PNode {
     node_id: String,
-    peers: Arc<RwLock<Vec<String>>>,
+    peers: Arc<RwLock<Vec<(String, String, u64)>>>,
     address: String,
 }
 
@@ -193,28 +193,37 @@ impl P2PNode {
         }
     }
 
-    pub async fn connect(&self, peer_address: String) -> AuriaResult<()> {
+    pub async fn connect_p2p(&self, peer_address: String) -> AuriaResult<()> {
         let mut peers = self.peers.write().await;
-        if !peers.contains(&peer_address) {
-            peers.push(peer_address);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        if !peers.iter().any(|(addr, _, _)| addr == &peer_address) {
+            let node_id = uuid::Uuid::new_v4().to_string();
+            peers.push((peer_address, node_id, now));
         }
         Ok(())
     }
 
-    pub async fn disconnect(&self, peer_address: String) -> AuriaResult<()> {
+    pub async fn disconnect_p2p(&self, peer_address: String) -> AuriaResult<()> {
         let mut peers = self.peers.write().await;
-        peers.retain(|p| p != &peer_address);
+        peers.retain(|(addr, _, _)| addr != &peer_address);
         Ok(())
     }
 
     pub async fn broadcast(&self, message: &[u8]) -> AuriaResult<()> {
-        let peers = self.peers.read().await;
-        for _peer in peers.iter() {
-        }
+        let _peers = self.peers.read().await;
         Ok(())
     }
 
     pub async fn get_peers(&self) -> Vec<String> {
+        let peers = self.peers.read().await;
+        peers.iter().map(|(addr, _, _)| addr.clone()).collect()
+    }
+
+    pub async fn get_peers_info(&self) -> Vec<(String, String, u64)> {
         self.peers.read().await.clone()
     }
 

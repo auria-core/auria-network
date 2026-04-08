@@ -5,27 +5,31 @@
 //     Provides OpenAI-compatible REST API for inference requests.
 
 use axum::{
-    extract::{State, Path},
-    http::StatusCode,
-    response::{IntoResponse, Response, Json},
+    extract::{State, Path, Query},
+    http::{StatusCode, HeaderValue},
+    response::{IntoResponse, Response, Json, sse::{Event, Sse}},
     routing::{get, post},
     Router,
 };
+use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::net::SocketAddr;
 use tokio::sync::RwLock;
+use tokio::time::Duration;
 
 use crate::{NetworkServer, RequestStatus};
 use crate::P2PNode;
 use crate::{InferenceRequest, InferenceResponse, RequestHandler, UsageInfo};
 use auria_core::{RequestId, Tier};
+use auria_observability::MetricsCollector;
 
 #[derive(Clone)]
 pub struct HttpServerState {
     pub network_server: Arc<NetworkServer>,
     pub p2p_node: Arc<RwLock<Option<P2PNode>>>,
     pub inference_handlers: Arc<RwLock<Vec<Box<dyn RequestHandler>>>>,
+    pub metrics: Arc<MetricsCollector>,
 }
 
 impl HttpServerState {
@@ -34,6 +38,7 @@ impl HttpServerState {
             network_server: Arc::new(network_server),
             p2p_node: Arc::new(RwLock::new(None)),
             inference_handlers: Arc::new(RwLock::new(Vec::new())),
+            metrics: Arc::new(MetricsCollector::new()),
         }
     }
 
@@ -196,6 +201,7 @@ async fn chat_completions(
     State(state): State<HttpServerState>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<Json<ChatCompletionResponse>, AppError> {
+    let start_time = std::time::Instant::now();
     let request_id = uuid::Uuid::new_v4().to_string();
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -208,20 +214,23 @@ async fn chat_completions(
         .collect();
     let prompt = messages_str.join("\n");
 
+    let tier = tier_from_string(&request.model);
     let inference_req = InferenceRequest {
-        tier: tier_from_string(&request.model),
+        tier,
         prompt,
         max_tokens: request.max_tokens.unwrap_or(100),
     };
 
     let handlers = state.inference_handlers.read().await;
     let mut response_text = String::new();
+    let mut success = false;
     
     for handler in handlers.iter() {
         if handler.supported_tiers().contains(&inference_req.tier) {
             match handler.handle_request(inference_req.clone()).await {
                 Ok(resp) => {
-                    response_text = resp.tokens.join("");
+                    response_text = resp.tokens.join(" ");
+                    success = true;
                     break;
                 }
                 Err(e) => {
@@ -233,6 +242,21 @@ async fn chat_completions(
 
     if response_text.is_empty() {
         response_text = format!("Simulated response for: {}", request.messages.last().map(|m| m.content.as_str()).unwrap_or(""));
+    }
+
+    let latency_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+    let tier_name = format!("{:?}", tier).to_lowercase();
+    let mut labels = std::collections::HashMap::new();
+    labels.insert("tier".to_string(), tier_name.clone());
+    labels.insert("type".to_string(), "chat".to_string());
+    state.metrics.increment_counter("auria_requests_total", 1, labels.clone()).await;
+    state.metrics.record_histogram("auria_request_latency_ms", latency_ms).await;
+    if success {
+        state.metrics.increment_counter("auria_requests_success", 1, labels).await;
+    } else {
+        let mut error_labels = labels.clone();
+        error_labels.insert("error".to_string(), "no_handler".to_string());
+        state.metrics.increment_counter("auria_requests_failed", 1, error_labels).await;
     }
 
     let response_len = response_text.len();
@@ -282,7 +306,7 @@ async fn completions(
         if handler.supported_tiers().contains(&inference_req.tier) {
             match handler.handle_request(inference_req.clone()).await {
                 Ok(resp) => {
-                    response_text = resp.tokens.join("");
+                    response_text = resp.tokens.join(" ");
                     break;
                 }
                 Err(e) => {
@@ -383,6 +407,158 @@ async fn node_status(
         active_requests: active_count,
         p2p_enabled: p2p_node.is_some(),
     })
+}
+
+async fn get_metrics(
+    State(state): State<HttpServerState>,
+) -> String {
+    let mut metrics_output = state.metrics.get_all_metrics().await;
+    
+    metrics_output.push_str("# HELP auria_active_requests Current number of active requests\n");
+    metrics_output.push_str("# TYPE auria_active_requests gauge\n");
+    let active = {
+        let requests = state.network_server.active_requests.read().await;
+        requests.len() as f64
+    };
+    metrics_output.push_str(&format!("auria_active_requests {}\n\n", active));
+    
+    metrics_output.push_str("# HELP auria_uptime_seconds Node uptime in seconds\n");
+    metrics_output.push_str("# TYPE auria_uptime_seconds counter\n");
+    metrics_output.push_str(&format!("auria_uptime_seconds {}\n", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()));
+    
+    metrics_output
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConnectPeerRequest {
+    pub address: String,
+    #[serde(default)]
+    pub port: u16,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PeerListResponse {
+    pub peers: Vec<PeerInfo>,
+    pub count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PeerActionResponse {
+    pub success: bool,
+    pub message: String,
+    pub peer: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PeerInfo {
+    pub node_id: String,
+    pub address: String,
+    pub connected_at: u64,
+    pub latency_ms: u64,
+}
+
+async fn list_peers(
+    State(state): State<HttpServerState>,
+) -> Json<PeerListResponse> {
+    let p2p = state.p2p_node.read().await;
+    let peers = if let Some(ref node) = *p2p {
+        node.get_peers_info().await
+    } else {
+        Vec::new()
+    };
+    
+    let peer_infos: Vec<PeerInfo> = peers.into_iter().map(|(id, addr, time)| {
+        PeerInfo {
+            node_id: hex::encode(&id),
+            address: addr,
+            connected_at: time,
+            latency_ms: 0,
+        }
+    }).collect();
+
+    Json(PeerListResponse {
+        count: peer_infos.len(),
+        peers: peer_infos,
+    })
+}
+
+async fn connect_peer(
+    State(state): State<HttpServerState>,
+    Json(request): Json<ConnectPeerRequest>,
+) -> Json<PeerActionResponse> {
+    let p2p = state.p2p_node.read().await;
+    
+    if let Some(ref node) = *p2p {
+        let address = if request.port > 0 {
+            format!("{}:{}", request.address, request.port)
+        } else {
+            request.address.clone()
+        };
+        
+        match node.connect_p2p(address.clone()).await {
+            Ok(()) => {
+                Json(PeerActionResponse {
+                    success: true,
+                    message: "Connected to peer".to_string(),
+                    peer: Some(request.address),
+                })
+            }
+            Err(e) => {
+                Json(PeerActionResponse {
+                    success: false,
+                    message: e.to_string(),
+                    peer: Some(request.address),
+                })
+            }
+        }
+    } else {
+        Json(PeerActionResponse {
+            success: false,
+            message: "P2P not initialized".to_string(),
+            peer: None,
+        })
+    }
+}
+
+async fn disconnect_peer(
+    State(state): State<HttpServerState>,
+    Json(request): Json<ConnectPeerRequest>,
+) -> Json<PeerActionResponse> {
+    let p2p = state.p2p_node.read().await;
+    
+    if let Some(ref node) = *p2p {
+        let address = if request.port > 0 {
+            format!("{}:{}", request.address, request.port)
+        } else {
+            request.address.clone()
+        };
+        
+        match node.disconnect_p2p(address.clone()).await {
+            Ok(()) => {
+                Json(PeerActionResponse {
+                    success: true,
+                    message: "Disconnected from peer".to_string(),
+                    peer: Some(request.address),
+                })
+            }
+            Err(e) => {
+                Json(PeerActionResponse {
+                    success: false,
+                    message: e.to_string(),
+                    peer: Some(request.address),
+                })
+            }
+        }
+    } else {
+        Json(PeerActionResponse {
+            success: false,
+            message: "P2P not initialized".to_string(),
+            peer: None,
+        })
+    }
 }
 
 async fn submit_request(
@@ -513,12 +689,18 @@ impl HttpServer {
         let state = self.state.clone();
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
+            .route("/v1/chat/completions/stream", post(chat_completions_stream))
             .route("/v1/completions", post(completions))
+            .route("/v1/completions/stream", post(completions_stream))
             .route("/v1/models", get(list_models))
             .route("/health", get(health))
             .route("/api/v1/status", get(node_status))
             .route("/api/v1/submit", post(submit_request))
             .route("/api/v1/status/:request_id", get(get_request_status))
+            .route("/api/v1/peers", get(list_peers))
+            .route("/api/v1/peers/connect", post(connect_peer))
+            .route("/api/v1/peers/disconnect", post(disconnect_peer))
+            .route("/metrics", get(get_metrics))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind(bind_addr).await?;
@@ -545,6 +727,191 @@ impl HttpServer {
             let _ = tx.send(());
         }
     }
+}
+
+async fn chat_completions_stream(
+    State(state): State<HttpServerState>,
+    Json(request): Json<ChatCompletionRequest>,
+) -> Response {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let messages_str: Vec<String> = request.messages
+        .iter()
+        .map(|m| format!("{:?}: {}", m.role, m.content))
+        .collect();
+    let prompt = messages_str.join("\n");
+
+    let inference_req = InferenceRequest {
+        tier: tier_from_string(&request.model),
+        prompt,
+        max_tokens: request.max_tokens.unwrap_or(100),
+    };
+
+    let handlers = state.inference_handlers.read().await;
+    
+    let all_tokens: Vec<String> = if request.stream.unwrap_or(false) {
+        let mut tokens = Vec::new();
+        for handler in handlers.iter() {
+            if handler.supported_tiers().contains(&inference_req.tier) {
+                match handler.handle_request(inference_req.clone()).await {
+                    Ok(resp) => {
+                        tokens = resp.tokens;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Handler error: {:?}", e);
+                    }
+                }
+            }
+        }
+        if tokens.is_empty() {
+            vec![format!("Response for: {}", request.messages.last().map(|m| m.content.as_str()).unwrap_or(""))]
+        } else {
+            tokens
+        }
+    } else {
+        vec![]
+    };
+
+    drop(handlers);
+
+    let model = request.model.clone();
+    let completion_id = format!("chatcmpl-{}", request_id);
+    let total = all_tokens.len();
+
+    let events: Vec<Result<Event, std::convert::Infallible>> = all_tokens.into_iter().enumerate().map(|(i, word)| {
+        let chunk = ChatCompletionChunk {
+            id: completion_id.clone(),
+            object: "chat.completion.chunk".to_string(),
+            created,
+            model: model.clone(),
+            choices: vec![ChatCompletionChunkChoice {
+                index: 0,
+                delta: ChatMessageDelta {
+                    role: if i == 0 { Some(MessageRole::Assistant) } else { None },
+                    content: Some(word),
+                },
+                finish_reason: if i == total.saturating_sub(1) { Some("stop".to_string()) } else { None },
+            }],
+        };
+        let data = serde_json::to_string(&chunk).unwrap_or_default();
+        Ok::<_, std::convert::Infallible>(Event::default().data(data))
+    }).collect();
+
+    Sse::new(stream::iter(events))
+        .into_response()
+}
+
+async fn completions_stream(
+    State(state): State<HttpServerState>,
+    Json(request): Json<CompletionRequest>,
+) -> Response {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let inference_req = InferenceRequest {
+        tier: tier_from_string(&request.model),
+        prompt: request.prompt.clone(),
+        max_tokens: request.max_tokens.unwrap_or(100),
+    };
+
+    let handlers = state.inference_handlers.read().await;
+    
+    let all_tokens: Vec<String> = if request.stream.unwrap_or(false) {
+        let mut tokens = Vec::new();
+        for handler in handlers.iter() {
+            if handler.supported_tiers().contains(&inference_req.tier) {
+                match handler.handle_request(inference_req.clone()).await {
+                    Ok(resp) => {
+                        tokens = resp.tokens;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Handler error: {:?}", e);
+                    }
+                }
+            }
+        }
+        if tokens.is_empty() {
+            vec![format!("Completion for: {}", request.prompt)]
+        } else {
+            tokens
+        }
+    } else {
+        vec![]
+    };
+
+    drop(handlers);
+
+    let model = request.model.clone();
+    let completion_id = format!("cmpl-{}", request_id);
+    let total = all_tokens.len();
+
+    let events: Vec<Result<Event, std::convert::Infallible>> = all_tokens.into_iter().enumerate().map(|(i, text)| {
+        let chunk = CompletionChunk {
+            id: completion_id.clone(),
+            object: "text_completion.chunk".to_string(),
+            created,
+            model: model.clone(),
+            choices: vec![CompletionChunkChoice {
+                text: text.clone(),
+                index: 0,
+                logprobs: None,
+                finish_reason: if i == total.saturating_sub(1) { Some("stop".to_string()) } else { None },
+            }],
+        };
+        let data = serde_json::to_string(&chunk).unwrap_or_default();
+        Ok::<_, std::convert::Infallible>(Event::default().data(data))
+    }).collect();
+
+    Sse::new(stream::iter(events))
+        .into_response()
+}
+
+#[derive(Debug, Serialize)]
+struct ChatCompletionChunk {
+    id: String,
+    object: String,
+    created: u64,
+    model: String,
+    choices: Vec<ChatCompletionChunkChoice>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatCompletionChunkChoice {
+    index: u32,
+    delta: ChatMessageDelta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatMessageDelta {
+    role: Option<MessageRole>,
+    content: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompletionChunk {
+    id: String,
+    object: String,
+    created: u64,
+    model: String,
+    choices: Vec<CompletionChunkChoice>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompletionChunkChoice {
+    text: String,
+    index: u32,
+    logprobs: Option<()>,
+    finish_reason: Option<String>,
 }
 
 pub mod conversion {
