@@ -44,6 +44,18 @@ pub enum RequestStatus {
 pub trait RequestHandler: Send + Sync {
     async fn handle_request(&self, request: InferenceRequest) -> AuriaResult<InferenceResponse>;
     fn supported_tiers(&self) -> &[Tier];
+    fn backend_name(&self) -> &str {
+        "unknown"
+    }
+    async fn is_model_loaded(&self) -> bool {
+        false
+    }
+    async fn load_model(&self, _path: &str) -> AuriaResult<()> {
+        Err(AuriaError::ExecutionError("Not implemented".to_string()))
+    }
+    fn get_model_info(&self) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 #[derive(Clone)]

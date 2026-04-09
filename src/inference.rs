@@ -6,17 +6,22 @@
 
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::{InferenceRequest, InferenceResponse, UsageInfo, RequestHandler};
 use auria_core::{AuriaResult, ExpertId, RequestId, RoutingDecision, Tier, Tensor, TensorDType};
 use auria_execution::{ExecutionEngine, ExecutionState, ExecutionOutput};
 use auria_router::{DeterministicRouter, Router};
-use auria_backend_cpu::CpuBackendImpl;
+use auria_backend_cpu::{CpuBackendImpl, GGUFModelRunner};
 
 pub struct InferenceService {
     router: DeterministicRouter,
     engine: ExecutionEngine<CpuBackendImpl>,
     vocabulary: Vec<String>,
+    model_runner: Option<Arc<GGUFModelRunner>>,
+    model_loaded: Arc<RwLock<bool>>,
+    model_path: Option<String>,
 }
 
 impl InferenceService {
@@ -27,7 +32,49 @@ impl InferenceService {
         
         let vocabulary = Self::create_vocabulary();
         
-        Self { router, engine, vocabulary }
+        Self { 
+            router, 
+            engine, 
+            vocabulary,
+            model_runner: None,
+            model_loaded: Arc::new(RwLock::new(false)),
+            model_path: None,
+        }
+    }
+    
+    pub fn with_model(model_path: &str) -> Self {
+        let runner = GGUFModelRunner::new();
+        let mut service = Self::new();
+        service.model_runner = Some(Arc::new(runner));
+        service.model_path = Some(model_path.to_string());
+        service
+    }
+    
+    pub async fn load_model(&self, model_path: &str) -> AuriaResult<()> {
+        if let Some(ref runner) = self.model_runner {
+            runner.load_model(model_path).await?;
+            let mut loaded = self.model_loaded.write().await;
+            *loaded = true;
+            tracing::info!("Model loaded: {}", model_path);
+            Ok(())
+        } else {
+            Err(auria_core::AuriaError::ExecutionError(
+                "No model runner configured".to_string()
+            ))
+        }
+    }
+    
+    pub async fn is_model_loaded(&self) -> bool {
+        *self.model_loaded.read().await
+    }
+    
+    pub fn get_model_info(&self) -> Option<serde_json::Value> {
+        self.model_path.as_ref().map(|path| {
+            serde_json::json!({
+                "model_path": path,
+                "loaded": false,
+            })
+        })
     }
     
     fn create_vocabulary() -> Vec<String> {
@@ -114,6 +161,23 @@ impl InferenceService {
         max_tokens: u32,
         tier: Tier,
     ) -> Result<(String, UsageInfo), auria_core::AuriaError> {
+        if let (Some(runner), true) = (&self.model_runner, *self.model_loaded.read().await) {
+            let tokens = runner.infer(prompt, max_tokens as usize, 0.7, 0.9).await
+                .map_err(|e| auria_core::AuriaError::ExecutionError(e.to_string()))?;
+            
+            let text = tokens.join(" ");
+            let input_tokens = self.tokenize(prompt);
+            let output_tokens_count = tokens.len();
+            
+            let usage = UsageInfo {
+                prompt_tokens: input_tokens.len() as u32,
+                completion_tokens: output_tokens_count as u32,
+                total_tokens: (input_tokens.len() + output_tokens_count) as u32,
+            };
+            
+            return Ok((text, usage));
+        }
+        
         let input_tokens = self.tokenize(prompt);
         
         let output_tokens = self.generate_response(prompt, max_tokens, tier);
@@ -161,5 +225,36 @@ impl RequestHandler for InferenceService {
     
     fn supported_tiers(&self) -> &[Tier] {
         &[Tier::Nano, Tier::Standard, Tier::Pro, Tier::Max]
+    }
+    
+    fn backend_name(&self) -> &str {
+        "cpu"
+    }
+    
+    async fn is_model_loaded(&self) -> bool {
+        *self.model_loaded.read().await
+    }
+    
+    async fn load_model(&self, path: &str) -> AuriaResult<()> {
+        if let Some(ref runner) = self.model_runner {
+            runner.load_model(path).await?;
+            let mut loaded = self.model_loaded.write().await;
+            *loaded = true;
+            tracing::info!("Model loaded: {}", path);
+            Ok(())
+        } else {
+            Err(auria_core::AuriaError::ExecutionError(
+                "No model runner configured".to_string()
+            ))
+        }
+    }
+    
+    fn get_model_info(&self) -> Option<serde_json::Value> {
+        self.model_path.as_ref().map(|path| {
+            serde_json::json!({
+                "model_path": path,
+                "loaded": false,
+            })
+        })
     }
 }

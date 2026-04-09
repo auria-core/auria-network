@@ -5,13 +5,13 @@
 //     Provides OpenAI-compatible REST API for inference requests.
 
 use axum::{
-    extract::{State, Path, Query},
+    extract::{State, Path, Query, WebSocketUpgrade},
     http::{StatusCode, HeaderValue},
     response::{IntoResponse, Response, Json, sse::{Event, Sse}},
     routing::{get, post},
     Router,
 };
-use futures_util::stream;
+use futures_util::{stream, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::net::SocketAddr;
@@ -21,8 +21,10 @@ use tokio::time::Duration;
 use crate::{NetworkServer, RequestStatus};
 use crate::P2PNode;
 use crate::{InferenceRequest, InferenceResponse, RequestHandler, UsageInfo};
-use auria_core::{RequestId, Tier};
+use auria_core::{RequestId, Tier, UsageStats, ExpertId};
 use auria_observability::MetricsCollector;
+use auria_settlement::{OnChainSettlement, OnChainSettlementConfig, OnChainSettlementStatus, SettlementSubmission};
+use auria_cluster::{ClusterCoordinator, ClusterConfig, WorkerNode, WorkerStatus};
 
 #[derive(Clone)]
 pub struct HttpServerState {
@@ -30,6 +32,8 @@ pub struct HttpServerState {
     pub p2p_node: Arc<RwLock<Option<P2PNode>>>,
     pub inference_handlers: Arc<RwLock<Vec<Box<dyn RequestHandler>>>>,
     pub metrics: Arc<MetricsCollector>,
+    pub settlement: Arc<RwLock<Option<OnChainSettlement>>>,
+    pub cluster: Arc<RwLock<Option<ClusterCoordinator>>>,
 }
 
 impl HttpServerState {
@@ -39,6 +43,8 @@ impl HttpServerState {
             p2p_node: Arc::new(RwLock::new(None)),
             inference_handlers: Arc::new(RwLock::new(Vec::new())),
             metrics: Arc::new(MetricsCollector::new()),
+            settlement: Arc::new(RwLock::new(None)),
+            cluster: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -50,6 +56,30 @@ impl HttpServerState {
     pub async fn set_p2p_node(&self, node: P2PNode) {
         let mut p2p = self.p2p_node.write().await;
         *p2p = Some(node);
+    }
+
+    pub async fn set_settlement(&self, settlement: OnChainSettlement) {
+        let mut s = self.settlement.write().await;
+        *s = Some(settlement);
+    }
+
+    pub async fn set_cluster(&self, cluster: ClusterCoordinator) {
+        let mut c = self.cluster.write().await;
+        *c = Some(cluster);
+    }
+
+    pub async fn add_settlement_receipt(
+        &self,
+        request_id: RequestId,
+        expert_ids: Vec<ExpertId>,
+        usage: UsageStats,
+    ) -> Option<String> {
+        let s = self.settlement.read().await;
+        if let Some(settlement) = s.as_ref() {
+            settlement.add_receipt(request_id, expert_ids, usage).await.ok()
+        } else {
+            None
+        }
     }
 }
 
@@ -700,7 +730,17 @@ impl HttpServer {
             .route("/api/v1/peers", get(list_peers))
             .route("/api/v1/peers/connect", post(connect_peer))
             .route("/api/v1/peers/disconnect", post(disconnect_peer))
+            .route("/api/v1/settlement/status", get(get_settlement_status))
+            .route("/api/v1/settlement/submit", post(submit_settlement))
+            .route("/api/v1/settlement/withdraw", post(withdraw_settlement_rewards))
+            .route("/api/v1/settlement/history", get(get_settlement_history))
+            .route("/api/v1/cluster/status", get(get_cluster_status))
+            .route("/api/v1/cluster/workers", get(get_cluster_workers))
+            .route("/api/v1/cluster/workers/add", post(add_cluster_worker))
+            .route("/api/v1/model/status", get(get_model_status))
+            .route("/api/v1/model/load", post(load_model))
             .route("/metrics", get(get_metrics))
+            .route("/ws/inference", get(websocket_inference))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind(bind_addr).await?;
@@ -912,6 +952,583 @@ struct CompletionChunkChoice {
     index: u32,
     logprobs: Option<()>,
     finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WsInferenceRequest {
+    pub id: String,
+    pub method: String,
+    pub params: WsInferenceParams,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WsInferenceParams {
+    pub model: String,
+    pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WsResponse {
+    pub id: String,
+    pub method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<WsResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<WsError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WsResult {
+    pub model: String,
+    pub choices: Vec<WsChoice>,
+    pub usage: Usage,
+    pub created: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WsChoice {
+    pub index: u32,
+    pub message: ChatMessage,
+    pub finish_reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WsError {
+    pub code: i32,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SettlementStatusResponse {
+    pub connected: bool,
+    pub chain_id: u64,
+    pub wallet_address: String,
+    pub contract_address: String,
+    pub pending_receipts: u32,
+    pub total_settled: u64,
+    pub pending_rewards: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SettlementSubmitResponse {
+    pub success: bool,
+    pub tx_hash: Option<String>,
+    pub message: String,
+    pub receipt_count: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SettlementHistoryResponse {
+    pub submissions: Vec<SettlementHistoryItem>,
+    pub total: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SettlementHistoryItem {
+    pub submission_id: String,
+    pub tx_hash: String,
+    pub receipt_count: u32,
+    pub merkle_root: String,
+    pub status: String,
+    pub submitted_at: u64,
+    pub confirmed_at: Option<u64>,
+    pub gas_used: Option<u64>,
+}
+
+async fn get_settlement_status(
+    State(state): State<HttpServerState>,
+) -> Json<SettlementStatusResponse> {
+    let s = state.settlement.read().await;
+    
+    if let Some(settlement) = s.as_ref() {
+        match settlement.get_status().await {
+            Ok(status) => {
+                return Json(SettlementStatusResponse {
+                    connected: status.is_connected,
+                    chain_id: status.chain_id,
+                    wallet_address: status.wallet_address,
+                    contract_address: status.contract_address,
+                    pending_receipts: status.pending_receipts,
+                    total_settled: status.total_settled,
+                    pending_rewards: status.pending_rewards,
+                });
+            }
+            Err(e) => {
+                tracing::warn!("Failed to get settlement status: {}", e);
+            }
+        }
+    }
+    
+    Json(SettlementStatusResponse {
+        connected: false,
+        chain_id: 0,
+        wallet_address: String::new(),
+        contract_address: String::new(),
+        pending_receipts: 0,
+        total_settled: 0,
+        pending_rewards: 0,
+    })
+}
+
+async fn submit_settlement(
+    State(state): State<HttpServerState>,
+) -> Json<SettlementSubmitResponse> {
+    let s = state.settlement.read().await;
+    
+    if let Some(settlement) = s.as_ref() {
+        match settlement.trigger_settlement().await {
+            Ok(tx_hash) => {
+                let pending = settlement.get_pending_receipt_count().await;
+                return Json(SettlementSubmitResponse {
+                    success: true,
+                    tx_hash: Some(tx_hash),
+                    message: "Settlement submitted successfully".to_string(),
+                    receipt_count: pending as u32,
+                });
+            }
+            Err(e) => {
+                return Json(SettlementSubmitResponse {
+                    success: false,
+                    tx_hash: None,
+                    message: e.to_string(),
+                    receipt_count: 0,
+                });
+            }
+        }
+    }
+    
+    Json(SettlementSubmitResponse {
+        success: false,
+        tx_hash: None,
+        message: "Settlement not configured".to_string(),
+        receipt_count: 0,
+    })
+}
+
+async fn withdraw_settlement_rewards(
+    State(state): State<HttpServerState>,
+) -> Json<SettlementSubmitResponse> {
+    let s = state.settlement.read().await;
+    
+    if let Some(settlement) = s.as_ref() {
+        match settlement.withdraw_rewards().await {
+            Ok(tx_hash) => {
+                return Json(SettlementSubmitResponse {
+                    success: true,
+                    tx_hash: Some(tx_hash),
+                    message: "Rewards withdrawn successfully".to_string(),
+                    receipt_count: 0,
+                });
+            }
+            Err(e) => {
+                return Json(SettlementSubmitResponse {
+                    success: false,
+                    tx_hash: None,
+                    message: e.to_string(),
+                    receipt_count: 0,
+                });
+            }
+        }
+    }
+    
+    Json(SettlementSubmitResponse {
+        success: false,
+        tx_hash: None,
+        message: "Settlement not configured".to_string(),
+        receipt_count: 0,
+    })
+}
+
+async fn get_settlement_history(
+    State(state): State<HttpServerState>,
+) -> Json<SettlementHistoryResponse> {
+    let s = state.settlement.read().await;
+    
+    if let Some(settlement) = s.as_ref() {
+        let submissions = settlement.get_submission_history().await;
+        let items: Vec<SettlementHistoryItem> = submissions.into_iter().map(|sub| {
+            let status_str = match &sub.status {
+                auria_settlement::SettlementSubmissionStatus::Pending => "pending",
+                auria_settlement::SettlementSubmissionStatus::Submitted => "submitted",
+                auria_settlement::SettlementSubmissionStatus::Confirmed => "confirmed",
+                auria_settlement::SettlementSubmissionStatus::Failed(_) => "failed",
+            };
+            SettlementHistoryItem {
+                submission_id: sub.submission_id,
+                tx_hash: sub.tx_hash,
+                receipt_count: sub.receipt_count,
+                merkle_root: sub.merkle_root,
+                status: status_str.to_string(),
+                submitted_at: sub.submitted_at,
+                confirmed_at: sub.confirmed_at,
+                gas_used: sub.gas_used,
+            }
+        }).collect();
+        
+        return Json(SettlementHistoryResponse {
+            total: items.len(),
+            submissions: items,
+        });
+    }
+    
+    Json(SettlementHistoryResponse {
+        total: 0,
+        submissions: vec![],
+    })
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClusterStatusResponse {
+    pub node_id: String,
+    pub is_leader: bool,
+    pub leader_id: Option<String>,
+    pub total_workers: usize,
+    pub pending_tasks: usize,
+    pub raft_info: Option<ClusterRaftInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClusterRaftInfo {
+    pub role: String,
+    pub term: u64,
+    pub commit_index: u64,
+    pub log_length: usize,
+    pub peers: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddWorkerRequest {
+    pub id: String,
+    pub address: String,
+    pub capabilities: String,
+    pub memory_total_mb: u64,
+    pub cpu_cores: u32,
+    pub gpu_available: bool,
+}
+
+async fn get_cluster_status(
+    State(state): State<HttpServerState>,
+) -> Json<ClusterStatusResponse> {
+    let c = state.cluster.read().await;
+    
+    if let Some(cluster) = c.as_ref() {
+        let stats = cluster.get_cluster_stats().await;
+        let raft_info = cluster.get_raft_info().await.map(|r| ClusterRaftInfo {
+            role: format!("{:?}", r.role),
+            term: r.term,
+            commit_index: r.commit_index,
+            log_length: r.log_length,
+            peers: r.peers,
+        });
+        
+        return Json(ClusterStatusResponse {
+            node_id: cluster.node_id().to_string(),
+            is_leader: stats.is_leader,
+            leader_id: stats.leader_id,
+            total_workers: stats.total_workers,
+            pending_tasks: stats.pending_tasks,
+            raft_info,
+        });
+    }
+    
+    Json(ClusterStatusResponse {
+        node_id: String::new(),
+        is_leader: false,
+        leader_id: None,
+        total_workers: 0,
+        pending_tasks: 0,
+        raft_info: None,
+    })
+}
+
+async fn add_cluster_worker(
+    State(state): State<HttpServerState>,
+    Json(request): Json<AddWorkerRequest>,
+) -> Json<serde_json::Value> {
+    let c = state.cluster.read().await;
+    
+    if let Some(cluster) = c.as_ref() {
+        let tier = match request.capabilities.to_lowercase().as_str() {
+            "nano" => Tier::Nano,
+            "standard" => Tier::Standard,
+            "pro" => Tier::Pro,
+            "max" => Tier::Max,
+            _ => Tier::Standard,
+        };
+        
+        let worker = WorkerNode {
+            id: request.id.clone(),
+            address: request.address.clone(),
+            capabilities: tier,
+            status: WorkerStatus::Idle,
+            load: 0.0,
+            memory_used_mb: 0,
+            memory_total_mb: request.memory_total_mb,
+            cpu_cores: request.cpu_cores,
+            gpu_available: request.gpu_available,
+            started_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            last_seen: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        };
+        
+        match cluster.add_worker(worker).await {
+            Ok(()) => {
+                return Json(serde_json::json!({
+                    "success": true,
+                    "message": format!("Worker {} added", request.id)
+                }));
+            }
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "success": false,
+                    "message": e.to_string()
+                }));
+            }
+        }
+    }
+    
+    Json(serde_json::json!({
+        "success": false,
+        "message": "Cluster not initialized"
+    }))
+}
+
+async fn get_cluster_workers(
+    State(state): State<HttpServerState>,
+) -> Json<serde_json::Value> {
+    let c = state.cluster.read().await;
+    
+    if let Some(cluster) = c.as_ref() {
+        let stats = cluster.get_cluster_stats().await;
+        return Json(serde_json::json!({
+            "total_workers": stats.total_workers,
+            "idle_workers": stats.idle_workers,
+            "busy_workers": stats.busy_workers,
+            "offline_workers": stats.offline_workers,
+            "is_leader": stats.is_leader,
+            "leader_id": stats.leader_id,
+        }));
+    }
+    
+    Json(serde_json::json!({
+        "total_workers": 0,
+        "idle_workers": 0,
+        "busy_workers": 0,
+        "offline_workers": 0,
+        "is_leader": false,
+        "leader_id": null,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelStatusResponse {
+    pub loaded: bool,
+    pub model_path: Option<String>,
+    pub model_type: Option<String>,
+    pub vocab_size: Option<usize>,
+    pub hidden_size: Option<usize>,
+    pub num_layers: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LoadModelRequest {
+    pub model_path: String,
+}
+
+async fn get_model_status(
+    State(state): State<HttpServerState>,
+) -> Json<ModelStatusResponse> {
+    let handlers = state.inference_handlers.read().await;
+    
+    let mut loaded = false;
+    let mut model_path = None;
+    let mut model_type = None;
+    let mut vocab_size = None;
+    let mut hidden_size = None;
+    let mut num_layers = None;
+    
+    for handler in handlers.iter() {
+        let handler_name = handler.backend_name();
+        if handler_name.contains("cpu") || handler_name.contains("gpu") {
+            loaded = handler.is_model_loaded().await;
+            if let Some(info) = handler.get_model_info() {
+                if let Some(path) = info.get("model_path").and_then(|v| v.as_str()) {
+                    model_path = Some(path.to_string());
+                }
+                if let Some(mtype) = info.get("model_type").and_then(|v| v.as_str()) {
+                    model_type = Some(mtype.to_string());
+                }
+            }
+        }
+    }
+    
+    Json(ModelStatusResponse {
+        loaded,
+        model_path,
+        model_type,
+        vocab_size,
+        hidden_size,
+        num_layers,
+    })
+}
+
+async fn load_model(
+    State(state): State<HttpServerState>,
+    Json(request): Json<LoadModelRequest>,
+) -> Json<serde_json::Value> {
+    let handlers = state.inference_handlers.read().await;
+    
+    for handler in handlers.iter() {
+        let handler_name = handler.backend_name();
+        if handler_name.contains("cpu") || handler_name.contains("gpu") {
+            match handler.load_model(&request.model_path).await {
+                Ok(()) => {
+                    return Json(serde_json::json!({
+                        "success": true,
+                        "message": format!("Model loaded from {}", request.model_path)
+                    }));
+                }
+                Err(e) => {
+                    return Json(serde_json::json!({
+                        "success": false,
+                        "message": format!("Failed to load model: {}", e)
+                    }));
+                }
+            }
+        }
+    }
+    
+    Json(serde_json::json!({
+        "success": false,
+        "message": "No compatible inference handler found"
+    }))
+}
+
+async fn websocket_inference(
+    ws: WebSocketUpgrade,
+    State(state): State<HttpServerState>,
+) -> Response {
+    ws.on_upgrade(|socket| handle_websocket(socket, state))
+}
+
+async fn handle_websocket(
+    socket: axum::extract::ws::WebSocket,
+    state: HttpServerState,
+) {
+    use axum::extract::ws::Message as WsMsg;
+    
+    let (mut write, mut read) = socket.split();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    
+    while let Some(msg) = read.next().await {
+        match msg {
+            Ok(WsMsg::Text(text)) => {
+                match serde_json::from_str::<WsInferenceRequest>(&text) {
+                    Ok(req) => {
+                        let created = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+
+                        let messages_str: Vec<String> = req.params.messages
+                            .iter()
+                            .map(|m| format!("{:?}: {}", m.role, m.content))
+                            .collect();
+                        let prompt = messages_str.join("\n");
+
+                        let tier = tier_from_string(&req.params.model);
+                        let inference_req = InferenceRequest {
+                            tier,
+                            prompt,
+                            max_tokens: req.params.max_tokens.unwrap_or(100),
+                        };
+
+                        let handlers = state.inference_handlers.read().await;
+                        let mut response_text = String::new();
+
+                        for handler in handlers.iter() {
+                            if handler.supported_tiers().contains(&inference_req.tier) {
+                                match handler.handle_request(inference_req.clone()).await {
+                                    Ok(resp) => {
+                                        response_text = resp.tokens.join(" ");
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Handler error: {:?}", e);
+                                    }
+                                }
+                            }
+                        }
+
+                        if response_text.is_empty() {
+                            response_text = format!("WS response for: {}", req.params.messages.last().map(|m| m.content.as_str()).unwrap_or(""));
+                        }
+
+                        let response_len = response_text.len();
+                        let ws_response = WsResponse {
+                            id: req.id.clone(),
+                            method: "inference.result".to_string(),
+                            result: Some(WsResult {
+                                model: req.params.model.clone(),
+                                choices: vec![WsChoice {
+                                    index: 0,
+                                    message: ChatMessage {
+                                        role: MessageRole::Assistant,
+                                        content: response_text,
+                                    },
+                                    finish_reason: "stop".to_string(),
+                                }],
+                                usage: Usage {
+                                    prompt_tokens: (req.params.messages.iter().map(|m| m.content.len()).sum::<usize>() / 4) as u32,
+                                    completion_tokens: (response_len / 4) as u32,
+                                    total_tokens: ((req.params.messages.iter().map(|m| m.content.len()).sum::<usize>() + response_len) / 4) as u32,
+                                },
+                                created,
+                            }),
+                            error: None,
+                        };
+
+                        if let Ok(json) = serde_json::to_string(&ws_response) {
+                            let _ = write.send(WsMsg::Text(json)).await;
+                        }
+                    }
+                    Err(e) => {
+                        let error_response = WsResponse {
+                            id: request_id.clone(),
+                            method: "error".to_string(),
+                            result: None,
+                            error: Some(WsError {
+                                code: -32700,
+                                message: format!("Parse error: {}", e),
+                            }),
+                        };
+                        if let Ok(json) = serde_json::to_string(&error_response) {
+                            let _ = write.send(WsMsg::Text(json)).await;
+                        }
+                    }
+                }
+            }
+            Ok(WsMsg::Close(_)) => {
+                break;
+            }
+            Err(e) => {
+                tracing::error!("WebSocket error: {}", e);
+                break;
+            }
+            _ => {}
+        }
+    }
 }
 
 pub mod conversion {
