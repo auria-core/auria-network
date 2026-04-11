@@ -9,7 +9,7 @@ pub mod p2p;
 pub mod http;
 pub mod inference;
 
-use auria_core::{AuriaResult, RequestId, Tier};
+use auria_core::{AuriaError, AuriaResult, RequestId, Tier};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use std::collections::HashMap;
