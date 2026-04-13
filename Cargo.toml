@@ -29,7 +29,7 @@ hex = "0.4"
 tokio-tungstenite = "0.21"
 futures-util = { version = "0.3", features = ["sink"] }
 futures = "0.3"
-axum = { version = "0.7", features = ["ws"] }
+axum = "0.7"
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 hyper = "1"
