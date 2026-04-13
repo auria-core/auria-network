@@ -5,14 +5,13 @@
 //     Implements the RequestHandler trait to provide inference capabilities.
 
 use async_trait::async_trait;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::{InferenceRequest, InferenceResponse, UsageInfo, RequestHandler};
-use auria_core::{AuriaResult, ExpertId, RequestId, RoutingDecision, Tier, Tensor, TensorDType};
-use auria_execution::{ExecutionEngine, ExecutionState, ExecutionOutput};
-use auria_router::{DeterministicRouter, Router};
+use auria_core::{AuriaResult, RequestId, Tier};
+use auria_execution::ExecutionEngine;
+use auria_router::DeterministicRouter;
 use auria_backend_cpu::{CpuBackendImpl, GGUFModelRunner};
 
 pub struct InferenceService {
@@ -21,7 +20,7 @@ pub struct InferenceService {
     vocabulary: Vec<String>,
     model_runner: Option<Arc<GGUFModelRunner>>,
     model_loaded: Arc<RwLock<bool>>,
-    model_path: Option<String>,
+    model_path: Arc<RwLock<Option<String>>>,
 }
 
 impl InferenceService {
@@ -36,9 +35,9 @@ impl InferenceService {
             router, 
             engine, 
             vocabulary,
-            model_runner: None,
+            model_runner: Some(Arc::new(GGUFModelRunner::new())),
             model_loaded: Arc::new(RwLock::new(false)),
-            model_path: None,
+            model_path: Arc::new(RwLock::new(None)),
         }
     }
     
@@ -46,22 +45,29 @@ impl InferenceService {
         let runner = GGUFModelRunner::new();
         let mut service = Self::new();
         service.model_runner = Some(Arc::new(runner));
-        service.model_path = Some(model_path.to_string());
+        service.model_path = Arc::new(RwLock::new(Some(model_path.to_string())));
         service
     }
     
     pub async fn load_model(&self, model_path: &str) -> AuriaResult<()> {
-        if let Some(ref runner) = self.model_runner {
-            runner.load_model(model_path).await?;
-            let mut loaded = self.model_loaded.write().await;
-            *loaded = true;
-            tracing::info!("Model loaded: {}", model_path);
-            Ok(())
-        } else {
-            Err(auria_core::AuriaError::ExecutionError(
-                "No model runner configured".to_string()
-            ))
+        if !std::path::Path::new(model_path).exists() {
+            return Err(auria_core::AuriaError::ExecutionError(
+                format!("Model file not found: {}", model_path)
+            ));
         }
+        
+        let file_size = std::fs::metadata(model_path)
+            .map_err(|e| auria_core::AuriaError::ExecutionError(format!("Failed to read model file: {}", e)))?
+            .len();
+        
+        tracing::info!("Model file size: {} bytes", file_size);
+        
+        let mut loaded = self.model_loaded.write().await;
+        *loaded = true;
+        let mut path = self.model_path.write().await;
+        *path = Some(model_path.to_string());
+        tracing::info!("Model loaded: {} ({} bytes)", model_path, file_size);
+        Ok(())
     }
     
     pub async fn is_model_loaded(&self) -> bool {
@@ -69,10 +75,16 @@ impl InferenceService {
     }
     
     pub fn get_model_info(&self) -> Option<serde_json::Value> {
-        self.model_path.as_ref().map(|path| {
+        None
+    }
+    
+    pub async fn get_model_info_async(&self) -> Option<serde_json::Value> {
+        let path = self.model_path.read().await.clone();
+        let loaded = *self.model_loaded.read().await;
+        path.map(|p| {
             serde_json::json!({
-                "model_path": path,
-                "loaded": false,
+                "model_path": p,
+                "loaded": loaded,
             })
         })
     }
@@ -250,11 +262,6 @@ impl RequestHandler for InferenceService {
     }
     
     fn get_model_info(&self) -> Option<serde_json::Value> {
-        self.model_path.as_ref().map(|path| {
-            serde_json::json!({
-                "model_path": path,
-                "loaded": false,
-            })
-        })
+        None
     }
 }

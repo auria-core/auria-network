@@ -9,7 +9,7 @@ pub mod p2p;
 pub mod http;
 pub mod inference;
 
-use auria_core::{AuriaResult, RequestId, Tier};
+use auria_core::{AuriaError, AuriaResult, RequestId, Tier};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use std::collections::HashMap;
@@ -194,6 +194,7 @@ pub struct P2PNode {
     node_id: String,
     peers: Arc<RwLock<Vec<(String, String, u64)>>>,
     address: String,
+    network: Option<Arc<p2p::P2PNetwork>>,
 }
 
 impl P2PNode {
@@ -202,41 +203,79 @@ impl P2PNode {
             node_id,
             peers: Arc::new(RwLock::new(Vec::new())),
             address,
+            network: None,
         }
+    }
+    
+    pub fn with_network(node_id: String, address: String, network: p2p::P2PNetwork) -> Self {
+        Self {
+            node_id,
+            peers: Arc::new(RwLock::new(Vec::new())),
+            address,
+            network: Some(Arc::new(network)),
+        }
+    }
+
+    pub async fn start_server(&self) -> AuriaResult<()> {
+        if let Some(ref network) = self.network {
+            network.start_server().await?;
+        }
+        Ok(())
     }
 
     pub async fn connect_p2p(&self, peer_address: String) -> AuriaResult<()> {
-        let mut peers = self.peers.write().await;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        
-        if !peers.iter().any(|(addr, _, _)| addr == &peer_address) {
-            let node_id = uuid::Uuid::new_v4().to_string();
-            peers.push((peer_address, node_id, now));
+        if let Some(ref network) = self.network {
+            network.connect_to_peer(&peer_address).await
+        } else {
+            let mut peers = self.peers.write().await;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            
+            if !peers.iter().any(|(addr, _, _)| addr == &peer_address) {
+                let node_id = uuid::Uuid::new_v4().to_string();
+                peers.push((peer_address.clone(), node_id, now));
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     pub async fn disconnect_p2p(&self, peer_address: String) -> AuriaResult<()> {
-        let mut peers = self.peers.write().await;
-        peers.retain(|(addr, _, _)| addr != &peer_address);
-        Ok(())
+        if let Some(ref network) = self.network {
+            network.disconnect(&peer_address).await
+        } else {
+            let mut peers = self.peers.write().await;
+            peers.retain(|(addr, _, _)| addr != &peer_address);
+            Ok(())
+        }
     }
 
     pub async fn broadcast(&self, message: &[u8]) -> AuriaResult<()> {
-        let _peers = self.peers.read().await;
+        if let Some(ref network) = self.network {
+            let msg = p2p::P2PMessage::Custom { payload: message.to_vec() };
+            network.broadcast(msg).await?;
+        }
         Ok(())
     }
 
     pub async fn get_peers(&self) -> Vec<String> {
-        let peers = self.peers.read().await;
-        peers.iter().map(|(addr, _, _)| addr.clone()).collect()
+        if let Some(ref network) = self.network {
+            network.get_peers().await.iter().map(|p| p.address_string()).collect()
+        } else {
+            let peers = self.peers.read().await;
+            peers.iter().map(|(addr, _, _)| addr.clone()).collect()
+        }
     }
 
     pub async fn get_peers_info(&self) -> Vec<(String, String, u64)> {
-        self.peers.read().await.clone()
+        if let Some(ref network) = self.network {
+            network.get_peers().await.iter().map(|p| {
+                (p.address_string(), hex::encode(&p.node_id), p.last_seen)
+            }).collect()
+        } else {
+            self.peers.read().await.clone()
+        }
     }
 
     pub fn node_id(&self) -> &str {

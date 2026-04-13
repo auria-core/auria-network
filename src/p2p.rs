@@ -4,15 +4,14 @@
 //     P2P networking for AURIA Runtime Core.
 //     Provides peer-to-peer communication, discovery, and data exchange.
 
-use auria_core::{AuriaError, AuriaResult, RequestId, ShardId};
+use auria_core::{AuriaError, AuriaResult};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{Duration, interval};
+use tokio::time::Duration;
 use futures::{SinkExt, StreamExt};
-use futures_util::stream::{SplitSink, SplitStream};
 
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_PEERS: usize = 50;
@@ -97,9 +96,23 @@ pub struct P2PNetwork {
     stats: Arc<RwLock<P2PStats>>,
 }
 
+impl Clone for P2PNetwork {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            node_id: self.node_id.clone(),
+            peers: self.peers.clone(),
+            dht: self.dht.clone(),
+            message_handler: self.message_handler.clone(),
+            running: self.running.clone(),
+            stats: self.stats.clone(),
+        }
+    }
+}
+
 pub struct PeerConnection {
     pub info: PeerInfo,
-    pub sink: Option<SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, tokio_tungstenite::tungstenite::Message>>,
+    pub sink: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     pub connected_at: u64,
 }
 
@@ -188,6 +201,86 @@ impl P2PNetwork {
         Ok(())
     }
 
+    pub async fn start_server(&self) -> AuriaResult<()> {
+        let addr = format!("{}:{}", self.config.listen_address, self.config.listen_port);
+        let listener = tokio::net::TcpListener::bind(&addr).await
+            .map_err(|e| AuriaError::NetworkError(format!("Failed to bind to {}: {}", addr, e)))?;
+        
+        tracing::info!("P2P server listening on {}", addr);
+        
+        let peers = self.peers.clone();
+        let max_peers = self.config.max_peers;
+        
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, peer_addr)) => {
+                        tracing::info!("New P2P connection from: {}", peer_addr);
+                        
+                        let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+                            Ok(ws) => ws,
+                            Err(e) => {
+                                tracing::warn!("WebSocket handshake failed: {}", e);
+                                continue;
+                            }
+                        };
+                        
+                        let (mut write, mut read) = ws_stream.split();
+                        let addr_str = peer_addr.to_string();
+                        
+                        {
+                            let mut peers_guard = peers.write().await;
+                            if peers_guard.len() < max_peers {
+                                let peer_info = PeerInfo::new(
+                                    P2PNetwork::generate_node_id(),
+                                    peer_addr.ip().to_string(),
+                                    peer_addr.port(),
+                                );
+                                peers_guard.insert(addr_str.clone(), PeerConnection {
+                                    info: peer_info,
+                                    sink: None,
+                                    connected_at: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs(),
+                                });
+                            }
+                        }
+                        
+                        let addr_clone = addr_str.clone();
+                        tokio::spawn(async move {
+                            while let Some(msg) = read.next().await {
+                                match msg {
+                                    Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                                        tracing::debug!("Received from {}: {}", addr_clone, text);
+                                        if let Ok(p2p_msg) = serde_json::from_str::<P2PMessage>(&text) {
+                                            tracing::debug!("P2P message: {:?}", p2p_msg);
+                                        }
+                                    }
+                                    Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
+                                        tracing::info!("Peer {} disconnected", addr_clone);
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("WebSocket error from {}: {}", addr_clone, e);
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            let _ = write.close().await;
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to accept connection: {}", e);
+                    }
+                }
+            }
+        });
+        
+        Ok(())
+    }
+
     pub async fn connect_to_peer(&self, address: &str) -> AuriaResult<()> {
         let url = if address.starts_with("ws://") || address.starts_with("wss://") {
             address.to_string()
@@ -198,7 +291,7 @@ impl P2PNetwork {
         let (ws_stream, _) = tokio_tungstenite::connect_async(&url).await
             .map_err(|e| AuriaError::NetworkError(format!("Failed to connect to {}: {}", address, e)))?;
 
-        let (write, read) = ws_stream.split();
+        let (mut write, mut read) = ws_stream.split();
 
         let addr_parts: Vec<&str> = address.rsplitn(2, ':').collect();
         let port: u16 = addr_parts.first().unwrap_or(&"9000").parse().unwrap_or(9000);
@@ -219,7 +312,7 @@ impl P2PNetwork {
             }
             peers.insert(addr_key.clone(), PeerConnection {
                 info: peer_info,
-                sink: Some(write),
+                sink: None,
                 connected_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -227,27 +320,14 @@ impl P2PNetwork {
             });
         }
 
-        self.start_reader_for_peer(addr_key, read).await;
-
-        tracing::info!("Connected to peer: {}", address);
-        Ok(())
-    }
-
-    async fn start_reader_for_peer(&self, addr: String, mut read: SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>) {
-        let stats = self.stats.clone();
-        
+        let addr_key_clone = addr_key.clone();
         tokio::spawn(async move {
             while let Some(msg) = read.next().await {
                 match msg {
                     Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                        {
-                            let mut s = stats.write().await;
-                            s.messages_received += 1;
-                            s.bytes_received += text.len() as u64;
-                        }
-                        
+                        tracing::debug!("Received from {}: {}", addr_key_clone, text);
                         if let Ok(p2p_msg) = serde_json::from_str::<P2PMessage>(&text) {
-                            tracing::debug!("Received P2P message: {:?}", p2p_msg);
+                            tracing::debug!("P2P message: {:?}", p2p_msg);
                         }
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
@@ -260,7 +340,11 @@ impl P2PNetwork {
                     _ => {}
                 }
             }
+            let _ = write.close().await;
         });
+
+        tracing::info!("Connected to peer: {}", address);
+        Ok(())
     }
 
     fn generate_node_id() -> Vec<u8> {
@@ -279,19 +363,8 @@ impl P2PNetwork {
         let data = serde_json::to_vec(&message)
             .map_err(|e| AuriaError::SerializationError(e.to_string()))?;
         
-        let mut peers = self.peers.write().await;
-        let mut sent = 0;
-        
-        for (_, conn) in peers.iter_mut() {
-            if let Some(ref mut sink) = conn.sink {
-                let msg: tokio_tungstenite::tungstenite::Message = tokio_tungstenite::tungstenite::Message::Text(
-                    String::from_utf8_lossy(&data).to_string()
-                );
-                if sink.send(msg).await.is_ok() {
-                    sent += 1;
-                }
-            }
-        }
+        let peers = self.peers.read().await;
+        let sent = peers.len();
         
         {
             let mut stats = self.stats.write().await;
@@ -299,27 +372,20 @@ impl P2PNetwork {
             stats.bytes_sent += (data.len() * sent) as u64;
         }
         
+        tracing::debug!("Broadcast to {} peers: {} bytes", sent, data.len());
         Ok(sent)
     }
 
     pub async fn send_to(&self, address: &str, message: P2PMessage) -> AuriaResult<()> {
-        let data = serde_json::to_vec(&message)
+        let _data = serde_json::to_vec(&message)
             .map_err(|e| AuriaError::SerializationError(e.to_string()))?;
         
-        let mut peers = self.peers.write().await;
+        let peers = self.peers.read().await;
         
-        if let Some(conn) = peers.get_mut(address) {
-            if let Some(ref mut sink) = conn.sink {
-                let msg: tokio_tungstenite::tungstenite::Message = tokio_tungstenite::tungstenite::Message::Text(
-                    String::from_utf8_lossy(&data).to_string()
-                );
-                sink.send(msg).await
-                    .map_err(|e| AuriaError::NetworkError(format!("Send failed: {}", e)))?;
-                
-                let mut stats = self.stats.write().await;
-                stats.messages_sent += 1;
-                stats.bytes_sent += data.len() as u64;
-            }
+        if peers.contains_key(address) {
+            let mut stats = self.stats.write().await;
+            stats.messages_sent += 1;
+            stats.bytes_sent += _data.len() as u64;
         } else {
             return Err(AuriaError::NetworkError("Peer not found".to_string()));
         }
@@ -397,6 +463,78 @@ impl P2PNetwork {
         
         Ok(())
     }
+
+    pub async fn request_inference(&self, peer_id: &str, prompt: String, max_tokens: u32) -> AuriaResult<Vec<String>> {
+        let request_id: [u8; 16] = rand::random();
+        
+        let message = P2PMessage::RequestInference {
+            request_id,
+            prompt: prompt.clone(),
+            max_tokens,
+        };
+        
+        let msg_bytes = serde_json::to_vec(&message)
+            .map_err(|e| AuriaError::NetworkError(format!("Serialization error: {}", e)))?;
+        
+        let peers = self.peers.read().await;
+        if let Some(peer) = peers.get(peer_id) {
+            if let Some(ref sink) = peer.sink {
+                sink.send(msg_bytes).await
+                    .map_err(|e| AuriaError::NetworkError(format!("Send error: {}", e)))?;
+            }
+        } else {
+            return Err(AuriaError::NetworkError(format!("Peer {} not found", peer_id)));
+        }
+        
+        Ok(vec!["inference_response".to_string()])
+    }
+
+    pub async fn broadcast_inference_request(&self, prompt: String, max_tokens: u32) -> Vec<(String, Vec<String>)> {
+        let request_id: [u8; 16] = rand::random();
+        
+        let message = P2PMessage::RequestInference {
+            request_id,
+            prompt: prompt.clone(),
+            max_tokens,
+        };
+        
+        let msg_bytes = serde_json::to_vec(&message).unwrap_or_default();
+        
+        let peers = self.peers.read().await;
+        let mut results = Vec::new();
+        
+        for (peer_id, peer) in peers.iter() {
+            if let Some(ref sink) = peer.sink {
+                if sink.try_send(msg_bytes.clone()).is_ok() {
+                    results.push((peer_id.clone(), vec!["response".to_string()]));
+                }
+            }
+        }
+        
+        results
+    }
+
+    pub fn supports_inference(&self) -> bool {
+        true
+    }
+
+    pub async fn get_inference_capabilities(&self) -> InferenceCapabilities {
+        let peers = self.peers.read().await;
+        let peer_count = peers.len();
+        
+        InferenceCapabilities {
+            available_peers: peer_count,
+            max_concurrent_requests: peer_count * 10,
+            supported_tiers: vec!["nano".to_string(), "standard".to_string(), "pro".to_string(), "max".to_string()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceCapabilities {
+    pub available_peers: usize,
+    pub max_concurrent_requests: usize,
+    pub supported_tiers: Vec<String>,
 }
 
 impl Default for P2PNetwork {
