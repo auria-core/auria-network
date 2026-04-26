@@ -10,14 +10,9 @@ use tokio::sync::RwLock;
 
 use crate::{InferenceRequest, InferenceResponse, UsageInfo, RequestHandler};
 use auria_core::{AuriaResult, RequestId, Tier};
-use auria_execution::ExecutionEngine;
-use auria_router::DeterministicRouter;
-use auria_backend_cpu::{CpuBackendImpl, GGUFModelRunner};
+use auria_backend_cpu::GGUFModelRunner;
 
 pub struct InferenceService {
-    router: DeterministicRouter,
-    engine: ExecutionEngine<CpuBackendImpl>,
-    vocabulary: Vec<String>,
     model_runner: Option<Arc<GGUFModelRunner>>,
     model_loaded: Arc<RwLock<bool>>,
     model_path: Arc<RwLock<Option<String>>>,
@@ -25,16 +20,7 @@ pub struct InferenceService {
 
 impl InferenceService {
     pub fn new() -> Self {
-        let backend = CpuBackendImpl::new();
-        let router = DeterministicRouter::new(1024);
-        let engine = ExecutionEngine::new(backend);
-        
-        let vocabulary = Self::create_vocabulary();
-        
         Self { 
-            router, 
-            engine, 
-            vocabulary,
             model_runner: Some(Arc::new(GGUFModelRunner::new())),
             model_loaded: Arc::new(RwLock::new(false)),
             model_path: Arc::new(RwLock::new(None)),
@@ -89,19 +75,6 @@ impl InferenceService {
         })
     }
     
-    fn create_vocabulary() -> Vec<String> {
-        let base_words: Vec<&str> = vec![
-            "the", "be", "to", "of", "and", "a", "in", "that", "have", "I",
-            "it", "for", "not", "on", "with", "he", "as", "you", "do", "at",
-            "this", "but", "his", "by", "from", "they", "we", "say", "her", "she",
-            "or", "an", "will", "my", "one", "all", "would", "there", "their", "what",
-            "so", "up", "out", "if", "about", "who", "get", "which", "go", "me",
-            "hello", "world", "how", "are", "you", "today", "good", "morning", "great", "nice",
-            "thanks", "please", "help", "think", "know", "well", "just", "like", "very", "much",
-        ];
-        base_words.into_iter().map(|s| s.to_string()).collect()
-    }
-    
     fn tokenize(&self, text: &str) -> Vec<u32> {
         text.split_whitespace()
             .enumerate()
@@ -109,15 +82,6 @@ impl InferenceService {
                 let hash = word.bytes()
                     .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
                 (i as u32).wrapping_add(hash)
-            })
-            .collect()
-    }
-    
-    fn detokenize_tokens(&self, token_ids: &[u32]) -> Vec<String> {
-        token_ids.iter()
-            .map(|&id| {
-                let idx = (id as usize) % self.vocabulary.len();
-                self.vocabulary[idx].clone()
             })
             .collect()
     }

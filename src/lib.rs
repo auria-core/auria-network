@@ -193,25 +193,22 @@ impl GrpcServer {
 pub struct P2PNode {
     node_id: String,
     peers: Arc<RwLock<Vec<(String, String, u64)>>>,
-    address: String,
     network: Option<Arc<p2p::P2PNetwork>>,
 }
 
 impl P2PNode {
-    pub fn new(node_id: String, address: String) -> Self {
+    pub fn new(node_id: String, _address: String) -> Self {
         Self {
             node_id,
             peers: Arc::new(RwLock::new(Vec::new())),
-            address,
             network: None,
         }
     }
     
-    pub fn with_network(node_id: String, address: String, network: p2p::P2PNetwork) -> Self {
+    pub fn with_network(node_id: String, _address: String, network: p2p::P2PNetwork) -> Self {
         Self {
             node_id,
             peers: Arc::new(RwLock::new(Vec::new())),
-            address,
             network: Some(Arc::new(network)),
         }
     }

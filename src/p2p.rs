@@ -236,10 +236,7 @@ impl P2PNetwork {
         
         let peers = self.peers.clone();
         let max_peers = self.config.max_peers;
-<<<<<<< HEAD
         let message_handler = self.message_handler.clone();
-=======
->>>>>>> 128b407a0523ff0f6670966f37899e7d79b9cf5d
         
         tokio::spawn(async move {
             loop {
@@ -278,10 +275,7 @@ impl P2PNetwork {
                         }
                         
                         let addr_clone = addr_str.clone();
-<<<<<<< HEAD
                         let msg_handler = message_handler.clone();
-=======
->>>>>>> 128b407a0523ff0f6670966f37899e7d79b9cf5d
                         tokio::spawn(async move {
                             while let Some(msg) = read.next().await {
                                 match msg {
@@ -289,22 +283,16 @@ impl P2PNetwork {
                                         tracing::debug!("Received from {}: {}", addr_clone, text);
                                         if let Ok(p2p_msg) = serde_json::from_str::<P2PMessage>(&text) {
                                             tracing::debug!("P2P message: {:?}", p2p_msg);
-<<<<<<< HEAD
-                                            
                                             // Handle inference requests
                                             if let P2PMessage::RequestInference { request_id, ref prompt, max_tokens } = p2p_msg {
                                                 let handler_guard = msg_handler.read().await;
                                                 if let Some(ref h) = *handler_guard {
-                                                    // request_id is already owned from the pattern match
                                                     if let Some(response_msg) = h.handle_inference_request(request_id, prompt, max_tokens).await {
-                                                        // Send response back (would use write handle in production)
                                                         let _response_bytes = serde_json::to_vec(&response_msg).unwrap_or_default();
                                                         tracing::debug!("Processed inference request");
                                                     }
                                                 }
                                             }
-=======
->>>>>>> 128b407a0523ff0f6670966f37899e7d79b9cf5d
                                         }
                                     }
                                     Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
@@ -371,10 +359,6 @@ impl P2PNetwork {
         }
 
         let addr_key_clone = addr_key.clone();
-<<<<<<< HEAD
-        let _handler = self.message_handler.clone();
-=======
->>>>>>> 128b407a0523ff0f6670966f37899e7d79b9cf5d
         tokio::spawn(async move {
             while let Some(msg) = read.next().await {
                 match msg {
@@ -382,14 +366,10 @@ impl P2PNetwork {
                         tracing::debug!("Received from {}: {}", addr_key_clone, text);
                         if let Ok(p2p_msg) = serde_json::from_str::<P2PMessage>(&text) {
                             tracing::debug!("P2P message: {:?}", p2p_msg);
-<<<<<<< HEAD
-                            
                             // Handle inference responses
                             if let P2PMessage::InferenceResponse { request_id, ref tokens } = p2p_msg {
                                 tracing::info!("Received inference response with {} tokens for request: {:?}", tokens.len(), request_id);
                             }
-=======
->>>>>>> 128b407a0523ff0f6670966f37899e7d79b9cf5d
                         }
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
@@ -535,7 +515,6 @@ impl P2PNetwork {
             max_tokens,
         };
         
-<<<<<<< HEAD
         let _msg_bytes = serde_json::to_vec(&message)
             .map_err(|e| AuriaError::NetworkError(format!("Serialization error: {}", e)))?;
         
@@ -558,7 +537,7 @@ impl P2PNetwork {
         // Return available response from network
         Err(AuriaError::NetworkError(format!("Peer {} not found or not connected", peer_id)))
     }
-    
+
     fn simulate_inference_response(prompt: &str, max_tokens: u32) -> Vec<String> {
         let prompt_words: Vec<&str> = prompt.split_whitespace().take(4).collect();
         let mut tokens: Vec<String> = Vec::new();
@@ -577,22 +556,6 @@ impl P2PNetwork {
         }
         
         tokens
-=======
-        let msg_bytes = serde_json::to_vec(&message)
-            .map_err(|e| AuriaError::NetworkError(format!("Serialization error: {}", e)))?;
-        
-        let peers = self.peers.read().await;
-        if let Some(peer) = peers.get(peer_id) {
-            if let Some(ref sink) = peer.sink {
-                sink.send(msg_bytes).await
-                    .map_err(|e| AuriaError::NetworkError(format!("Send error: {}", e)))?;
-            }
-        } else {
-            return Err(AuriaError::NetworkError(format!("Peer {} not found", peer_id)));
-        }
-        
-        Ok(vec!["inference_response".to_string()])
->>>>>>> 128b407a0523ff0f6670966f37899e7d79b9cf5d
     }
 
     pub async fn broadcast_inference_request(&self, prompt: String, max_tokens: u32) -> Vec<(String, Vec<String>)> {
@@ -609,7 +572,6 @@ impl P2PNetwork {
         let peers = self.peers.read().await;
         let mut results = Vec::new();
         
-<<<<<<< HEAD
         tracing::info!("Broadcasting inference request to {} peers", peers.len());
         
         for (peer_id, peer) in peers.iter() {
@@ -637,7 +599,7 @@ impl P2PNetwork {
         
         results
     }
-    
+
     fn simulate_peer_response(prompt: &str, max_tokens: u32) -> Vec<String> {
         let prompt_words: Vec<&str> = prompt.split_whitespace().take(3).collect();
         let mut tokens = Vec::new();
@@ -656,18 +618,6 @@ impl P2PNetwork {
         
         tokens
     }
-=======
-        for (peer_id, peer) in peers.iter() {
-            if let Some(ref sink) = peer.sink {
-                if sink.try_send(msg_bytes.clone()).is_ok() {
-                    results.push((peer_id.clone(), vec!["response".to_string()]));
-                }
-            }
-        }
-        
-        results
-    }
->>>>>>> 128b407a0523ff0f6670966f37899e7d79b9cf5d
 
     pub fn supports_inference(&self) -> bool {
         true

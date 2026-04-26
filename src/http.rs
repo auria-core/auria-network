@@ -20,7 +20,7 @@ use tokio::sync::RwLock;
 
 use crate::{NetworkServer, RequestStatus};
 use crate::P2PNode;
-use crate::{InferenceRequest, InferenceResponse, RequestHandler, UsageInfo};
+use crate::{InferenceRequest, InferenceResponse, RequestHandler};
 use auria_core::{RequestId, Tier, UsageStats, ExpertId};
 use auria_observability::MetricsCollector;
 use auria_settlement::OnChainSettlement;
@@ -83,7 +83,7 @@ impl ClusterCoordinator {
         })
     }
 
-    fn simulate_inference(prompt: &str, max_tokens: u32, tier: &Tier) -> Vec<String> {
+    fn simulate_inference(_prompt: &str, max_tokens: u32, tier: &Tier) -> Vec<String> {
         let base_response: Vec<&str> = match tier {
             Tier::Nano => vec!["Okay", "sounds", "good", "!"],
             Tier::Standard => vec!["Here", "is", "some", "information"],
@@ -1680,9 +1680,9 @@ async fn get_model_status(
     let mut loaded = false;
     let mut model_path = None;
     let mut model_type = None;
-    let mut vocab_size = None;
-    let mut hidden_size = None;
-    let mut num_layers = None;
+    let vocab_size = None;
+    let hidden_size = None;
+    let num_layers = None;
     
     for handler in handlers.iter() {
         let handler_name = handler.backend_name();
